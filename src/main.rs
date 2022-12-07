@@ -35,7 +35,7 @@ fn get_note_name(note: Note) -> String {
         9 => "A",
         10 => "A♯",
         11 => "B",
-        _ => panic!("Invalid match")
+        _ => panic!("Invalid match"),
     };
 
     format!("{note_name}{octave}")
@@ -94,7 +94,7 @@ fn print_frequency_spectrum(bins: &[Complex<f32>]) {
 }
 
 /// Convert the given samples into the frequency spectrum and print the results
-fn do_fourier_transform(samples: &[f32], sample_frequency: usize) -> Vec<(Note, f32)> {
+fn do_fourier_transform(samples: &[f32], sample_frequency: usize) -> impl Iterator<Item = (Note, f32)> + 'static {
     // make an FFT planner
     let mut real_planner = RealFftPlanner::<f32>::new();
 
@@ -127,22 +127,17 @@ fn do_fourier_transform(samples: &[f32], sample_frequency: usize) -> Vec<(Note, 
 
     // Now that we have the frequency spectrum, select the bins that correspond
     // to notes.
-    let note_magnitudes = (-48..39).map(|note| weighted_index(get_note_freq(note) / bin_width)).collect_vec();
+    let note_magnitudes = (-48..39)
+        .map(|note| weighted_index(get_note_freq(note) / bin_width))
+        .collect_vec();
 
     // Have to define my own function for this. reduce() expects a function that takes references
     // to f32, but f32::max takes just f32, and rust can't fill in the gaps.
-    let max_f32 = |x, y| if x > y { x } else { y };
+    //let max_f32 = |x, y| if x > y { x } else { y };
 
-    let max_magnitude = *note_magnitudes.iter().reduce(max_f32).unwrap();
+    //let max_magnitude = *note_magnitudes.iter().reduce(max_f32).unwrap();
 
-    // Anything above 25% of the volume of the loudest note is considered to be present in the
-    // recording.
-    let threshold = 0.25_f32;
-
-    (-48..39)
-        .zip(note_magnitudes.into_iter())
-        .filter(|(_note, mag)| *mag / max_magnitude > threshold)
-        .collect_vec()
+    (-48..39).zip(note_magnitudes.into_iter())
 }
 
 fn make_tone_iter<'a>(
@@ -173,7 +168,10 @@ fn main() {
         .collect_vec();
     let samples = make_tone_iter(&frequencies, sample_hz, sample_count).collect_vec();
 
-    let notes = do_fourier_transform(&samples[..], sample_hz).into_iter().map(|(x, _y)| x);
+    let notes = do_fourier_transform(&samples[..], sample_hz)
+        .into_iter()
+        .filter(|(_note, mag)| *mag > 50.0_f32)
+        .map(|(x, _y)| x);
 
     for note in notes {
         println!("Sample contained note {}", get_note_name(note));
@@ -201,14 +199,20 @@ mod tests {
     }
 
     fn do_tone_test(sample_hz: usize, sample_count: usize, notes: &Vec<Note>) {
-        let frequencies = notes
-            .iter()
-            .map(|note| get_note_freq(*note))
-            .collect_vec();
+        let frequencies = notes.iter().map(|note| get_note_freq(*note)).collect_vec();
 
         let samples = make_tone_iter(&frequencies, sample_hz, sample_count).collect_vec();
 
-        assert_eq!(do_fourier_transform(&samples[..], sample_hz).into_iter().map(|(x, _y)| x).collect_vec(), *notes);
+        let threshold = 50.0_f32;
+
+        assert_eq!(
+            do_fourier_transform(&samples[..], sample_hz)
+                .into_iter()
+                .filter(|(_note, mag)| *mag > threshold)
+                .map(|(x, _y)| x)
+                .collect_vec(),
+            *notes
+        );
     }
 
     #[test]
