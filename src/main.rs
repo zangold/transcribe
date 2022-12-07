@@ -85,7 +85,7 @@ fn merge_audio(
                 None => None,
                 Some(l) => match it.next() {
                     None => None,
-                    Some(r) => Some((l + r) / 2.0),
+                    Some(_r) => Some(l),
                 },
             },
             x => panic!("Invalid number of channels: {x}"),
@@ -158,12 +158,12 @@ fn main() {
     let samples = merge_audio(&audio_info, samples).collect_vec();
     let sample_hz = audio_info.sample_rate() as usize;
 
-    // Set our window for fourier transforms to 0.25 seconds. This might cause problems with the low
+    // Set our window for fourier transforms to 0.2 seconds. This might cause problems with the low
     // end couple of octaves, where the notes don't differ by more than a few Hz.
-    let num_samples = sample_hz / 4;
+    let num_samples = sample_hz / 5;
 
     // 'stride' is the number of samples that we move our window forward each frame.
-    let stride = num_samples / 2;
+    let stride = num_samples / 4;
 
     let mut window_start = 0;
     let mut note_mag_time_series = Vec::<[f32; NUM_NOTES]>::new();
@@ -176,15 +176,44 @@ fn main() {
 
     note_mag_time_series.resize(samples.len() / stride, [0.0_f32; NUM_NOTES]);
 
-    let threshold = 10.0_f32;
-
     while window_start + num_samples < samples.len() {
         do_fourier_transform(&samples[window_start..window_start + num_samples], sample_hz)
-            .map(|x| if x < threshold { 0.0_f32 } else { x })
             .collect_slice_checked(&mut note_mag_time_series[series_index][..]);
 
         window_start += stride;
         series_index += 1;
+    }
+
+    let mut note_time_series = Vec::<[bool; NUM_NOTES]>::new();
+    note_time_series.resize(note_mag_time_series.len(), [false; NUM_NOTES]);
+
+    for frame_index in 1..note_mag_time_series.len() - 1 {
+        let prev_frame = &note_mag_time_series[frame_index - 1];
+        let frame = &note_mag_time_series[frame_index];
+        let next_frame = &note_mag_time_series[frame_index + 1];
+
+        for note in NOTES_RANGE.start + 1 .. NOTES_RANGE.end - 1 {
+            let note_index = note_index(note);
+
+            // threshold check: if this note was super quiet, then it probably wasn't played.
+            if frame[note_index] < 5.0_f32 {
+                continue;
+            }
+
+            // neighbour check: if the adjacent notes are quieter than this one, this probably
+            // was played.
+            if !(frame[note_index - 1] < frame[note_index] && frame[note_index] > frame[note_index + 1]) {
+                continue
+            }
+
+            // temporal check: if this note was quieter in the last frame, and is quieter in
+            // the next frame, then it was likely to just have been played.
+            if !(prev_frame[note_index] < frame[note_index] && frame[note_index] > next_frame[note_index]) {
+                continue;
+            }
+
+            note_time_series[frame_index][note_index] = true;
+        }
     }
 
     // Output the time series as CSV.
@@ -197,10 +226,15 @@ fn main() {
     println!("");
 
     for note in NOTES_RANGE {
-        print!("{},", get_note_name(note));
+        let name = get_note_name(note);
+        print!("{},", name);
 
         for i in 0..min(100, note_mag_time_series.len()) {
-            print!("{},", note_mag_time_series[i][note_index(note)]);
+            if note_time_series[i][note_index(note)] {
+                print!("{}({}),", name, note_mag_time_series[i][note_index(note)]);
+            } else {
+                print!(",");
+            }
         }
         println!("");
     }
