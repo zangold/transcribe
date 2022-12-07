@@ -1,19 +1,33 @@
+use collect_slice::CollectSlice;
 use itertools::Itertools;
+use std::cmp::min;
 use std::error::Error;
 
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
 
-//use rustfft::{num_complex::Complex, num_traits::Zero};
-
 type Note = i32;
 
+// A0 to C8
+const NOTES_RANGE: std::ops::Range<i32> = -48..40;
+
+const NUM_NOTES: usize = (NOTES_RANGE.end - NOTES_RANGE.start) as usize;
+
+/// Computes the frequency of the given note, where 'note' is an integer representing the number of
+/// semitones above (+ve) or below (-ve) A4. Assumes A4 is tuned to 440Hz and notes are distributed
+/// according to even temperament (semitones differ by the 12th root of 2).
 fn get_note_freq(note: Note) -> f32 {
     440.0_f32 * 2.0_f32.powf(note as f32 / 12.0_f32)
 }
 
+/// Convert a note value into an index into an array of notes; i.e., map from NOTES_RANGE to (0, 88)
+fn note_index(note: Note) -> usize {
+    (note - NOTES_RANGE.start) as usize
+}
+
+#[allow(dead_code)]
 fn get_note_name(note: Note) -> String {
-    assert!(-48 <= note && note <= 39);
+    assert!(NOTES_RANGE.contains(&note));
 
     // Consider 0 to be the middle C in this context, so our "A above middle C"
     // is now 9
@@ -47,9 +61,9 @@ fn load(filename: &str) -> Result<(creak::AudioInfo, creak::SampleIterator), Box
     let audio_info = decoder.info();
     let samples = decoder.into_samples()?;
 
-    //println!("audio: sample rate {} Hz", audio_info.sample_rate());
-    //println!("       channels: {}", audio_info.channels());
-    //println!("       format: {:?}", audio_info.format());
+    println!("audio: sample rate {} Hz", audio_info.sample_rate());
+    println!("       channels: {}", audio_info.channels());
+    println!("       format: {:?}", audio_info.format());
 
     Ok((audio_info, samples))
 }
@@ -93,8 +107,12 @@ fn print_frequency_spectrum(bins: &[Complex<f32>]) {
     }
 }
 
-/// Convert the given samples into the frequency spectrum and print the results
-fn do_fourier_transform(samples: &[f32], sample_frequency: usize) -> impl Iterator<Item = (Note, f32)> + 'static {
+/// Convert the given samples into the frequency spectrum.
+/// Zip the resulting iterator with NOTES_RANGE to get the int/f32 Note/magnitude pair
+fn do_fourier_transform(
+    samples: &[f32],
+    sample_frequency: usize,
+) -> impl Iterator<Item = f32> + 'static {
     // make an FFT planner
     let mut real_planner = RealFftPlanner::<f32>::new();
 
@@ -114,9 +132,13 @@ fn do_fourier_transform(samples: &[f32], sample_frequency: usize) -> impl Iterat
 
     let bin_width = sample_frequency as f32 / (samples.len() as f32);
 
+    // TODO bin_width is generally going to be too low to distinguish between low-end notes. Give
+    // the user a warning here that indicates the range of notes that might be incorrect due to
+    // fourier transform inaccuracies in the low range.
+
     // Notes frequently lie "between" bins, so take the weighted average of the
     // norms of the adjacent bins when computing a note's magnitude.
-    let weighted_index = |bin: f32| -> f32 {
+    let weighted_index = move |bin: f32| -> f32 {
         let first = spectrum[bin as usize].norm();
         let second = spectrum[bin as usize + 1].norm();
 
@@ -127,60 +149,99 @@ fn do_fourier_transform(samples: &[f32], sample_frequency: usize) -> impl Iterat
 
     // Now that we have the frequency spectrum, select the bins that correspond
     // to notes.
-    let note_magnitudes = (-48..39)
-        .map(|note| weighted_index(get_note_freq(note) / bin_width))
-        .collect_vec();
-
-    // Have to define my own function for this. reduce() expects a function that takes references
-    // to f32, but f32::max takes just f32, and rust can't fill in the gaps.
-    //let max_f32 = |x, y| if x > y { x } else { y };
-
-    //let max_magnitude = *note_magnitudes.iter().reduce(max_f32).unwrap();
-
-    (-48..39).zip(note_magnitudes.into_iter())
-}
-
-fn make_tone_iter<'a>(
-    frequencies: &'a [f32],
-    sample_rate: usize,
-    num_samples: usize,
-) -> impl Iterator<Item = f32> + 'a {
-    use std::f32::consts::PI;
-
-    (0..num_samples).into_iter().map(move |x| {
-        let theta = 2.0 * PI * x as f32 / sample_rate as f32;
-
-        frequencies.iter().map(|f| (f * theta).sin()).sum::<f32>() / (frequencies.len() as f32)
-    })
+    NOTES_RANGE.map(move |note| weighted_index(get_note_freq(note) / bin_width))
 }
 
 fn main() {
-    let (audio_info, samples) = load("sample.mp3").unwrap();
+    let (audio_info, samples) = load("canon_d_kassia.mp3").unwrap();
 
-    let _samples = merge_audio(&audio_info, samples);
+    let samples = merge_audio(&audio_info, samples).collect_vec();
+    let sample_hz = audio_info.sample_rate() as usize;
 
-    // For testing: do a harmonic scale starting from "A above middle C"
-    let sample_hz = 22050;
-    let sample_count = 7350;
-    let frequencies = (0..12)
-        .into_iter()
-        .map(|note| get_note_freq(note))
-        .collect_vec();
-    let samples = make_tone_iter(&frequencies, sample_hz, sample_count).collect_vec();
+    // Set our window for fourier transforms to 0.25 seconds. This might cause problems with the low
+    // end couple of octaves, where the notes don't differ by more than a few Hz.
+    let num_samples = sample_hz / 4;
 
-    let notes = do_fourier_transform(&samples[..], sample_hz)
-        .into_iter()
-        .filter(|(_note, mag)| *mag > 50.0_f32)
-        .map(|(x, _y)| x);
+    // 'stride' is the number of samples that we move our window forward each frame.
+    let stride = num_samples / 2;
 
-    for note in notes {
-        println!("Sample contained note {}", get_note_name(note));
+    let mut window_start = 0;
+    let mut note_mag_time_series = Vec::<[f32; NUM_NOTES]>::new();
+    let mut series_index = 0;
+
+    println!(
+        "Info: allocating {} bytes for (note/magnitude)-over-time data",
+        std::mem::size_of::<[f32; NUM_NOTES]>() * (samples.len() / stride)
+    );
+
+    note_mag_time_series.resize(samples.len() / stride, [0.0_f32; NUM_NOTES]);
+
+    let threshold = 10.0_f32;
+
+    while window_start + num_samples < samples.len() {
+        do_fourier_transform(&samples[window_start..window_start + num_samples], sample_hz)
+            .map(|x| if x < threshold { 0.0_f32 } else { x })
+            .collect_slice_checked(&mut note_mag_time_series[series_index][..]);
+
+        window_start += stride;
+        series_index += 1;
+    }
+
+    // Output the time series as CSV.
+    print!("time,");
+    for i in 0..min(100, note_mag_time_series.len()) {
+        let time = (i * stride) as f32 / (sample_hz as f32);
+
+        print!("{time},");
+    }
+    println!("");
+
+    for note in NOTES_RANGE {
+        print!("{},", get_note_name(note));
+
+        for i in 0..min(100, note_mag_time_series.len()) {
+            print!("{},", note_mag_time_series[i][note_index(note)]);
+        }
+        println!("");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Generate a tone using the given frequencies, at the given sample rate, for the given number
+    // of samples.
+    fn make_tone_iter<'a>(
+        frequencies: &'a [f32],
+        sample_rate: usize,
+        num_samples: usize,
+    ) -> impl Iterator<Item = f32> + 'a {
+        use std::f32::consts::PI;
+
+        (0..num_samples).into_iter().map(move |x| {
+            let theta = 2.0 * PI * x as f32 / sample_rate as f32;
+
+            frequencies.iter().map(|f| (f * theta).sin()).sum::<f32>() / (frequencies.len() as f32)
+        })
+    }
+
+    fn do_tone_test(sample_hz: usize, sample_count: usize, notes: &Vec<Note>) {
+        let frequencies = notes.iter().map(|note| get_note_freq(*note)).collect_vec();
+
+        let samples = make_tone_iter(&frequencies, sample_hz, sample_count).collect_vec();
+
+        let threshold = 50.0_f32;
+
+        assert_eq!(
+            NOTES_RANGE
+                .zip(do_fourier_transform(&samples[..], sample_hz))
+                .filter(|(_note, mag)| *mag > threshold)
+                .map(|(x, _y)| x)
+                .collect_vec(),
+            *notes
+        );
+    }
 
     #[test]
     /// Test to make sure that merge_audio yields the correct number of samples.
@@ -198,23 +259,6 @@ mod tests {
         assert_eq!(num_samples / 2, num_merged_samples);
     }
 
-    fn do_tone_test(sample_hz: usize, sample_count: usize, notes: &Vec<Note>) {
-        let frequencies = notes.iter().map(|note| get_note_freq(*note)).collect_vec();
-
-        let samples = make_tone_iter(&frequencies, sample_hz, sample_count).collect_vec();
-
-        let threshold = 50.0_f32;
-
-        assert_eq!(
-            do_fourier_transform(&samples[..], sample_hz)
-                .into_iter()
-                .filter(|(_note, mag)| *mag > threshold)
-                .map(|(x, _y)| x)
-                .collect_vec(),
-            *notes
-        );
-    }
-
     #[test]
     fn test_harmonic_scale() {
         // Harmonic scale starting from A4
@@ -225,5 +269,11 @@ mod tests {
     fn test_major_scale() {
         // Do a major scale starting from middle C
         do_tone_test(22050, 7350, &vec![-9, -7, -5, -4, -2, 0, 2, 3]);
+    }
+
+    #[test]
+    fn sanity_num_notes() {
+        assert_eq!(NUM_NOTES, 88);
+        assert_eq!(NOTES_RANGE.count(), 88)
     }
 }
