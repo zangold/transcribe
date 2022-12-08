@@ -75,18 +75,16 @@ fn load(filename: &str) -> Result<(creak::AudioInfo, creak::SampleIterator), Box
 fn merge_audio(
     info: &creak::AudioInfo,
     samples: creak::SampleIterator,
-) -> impl Iterator<Item = f32> + '_ {
+) -> impl Iterator<Item = f32> + 'static {
+    let channels = info.channels();
     samples
         .into_iter()
         .map(|x| x.unwrap())
-        .batching(|it| match info.channels() {
+        .batching(move |it| match channels {
             1 => it.next(),
             2 => match it.next() {
                 None => None,
-                Some(l) => match it.next() {
-                    None => None,
-                    Some(_r) => Some(l),
-                },
+                Some(l) => it.next().map(|_r| l),
             },
             x => panic!("Invalid number of channels: {x}"),
         })
@@ -103,7 +101,7 @@ fn print_frequency_spectrum(bins: &[Complex<f32>]) {
             print!("#");
         }
 
-        println!("");
+        println!();
     }
 }
 
@@ -177,8 +175,11 @@ fn main() {
     note_mag_time_series.resize(samples.len() / stride, [0.0_f32; NUM_NOTES]);
 
     while window_start + num_samples < samples.len() {
-        do_fourier_transform(&samples[window_start..window_start + num_samples], sample_hz)
-            .collect_slice_checked(&mut note_mag_time_series[series_index][..]);
+        do_fourier_transform(
+            &samples[window_start..window_start + num_samples],
+            sample_hz,
+        )
+        .collect_slice_checked(&mut note_mag_time_series[series_index][..]);
 
         window_start += stride;
         series_index += 1;
@@ -192,7 +193,7 @@ fn main() {
         let frame = &note_mag_time_series[frame_index];
         let next_frame = &note_mag_time_series[frame_index + 1];
 
-        for note in NOTES_RANGE.start + 1 .. NOTES_RANGE.end - 1 {
+        for note in NOTES_RANGE.start + 1..NOTES_RANGE.end - 1 {
             let note_index = note_index(note);
 
             // threshold check: if this note was super quiet, then it probably wasn't played.
@@ -202,13 +203,17 @@ fn main() {
 
             // neighbour check: if the adjacent notes are quieter than this one, this probably
             // was played.
-            if !(frame[note_index - 1] < frame[note_index] && frame[note_index] > frame[note_index + 1]) {
-                continue
+            if !(frame[note_index - 1] < frame[note_index]
+                && frame[note_index] > frame[note_index + 1])
+            {
+                continue;
             }
 
             // temporal check: if this note was quieter in the last frame, and is quieter in
             // the next frame, then it was likely to just have been played.
-            if !(prev_frame[note_index] < frame[note_index] && frame[note_index] > next_frame[note_index]) {
+            if !(prev_frame[note_index] < frame[note_index]
+                && frame[note_index] > next_frame[note_index])
+            {
                 continue;
             }
 
@@ -223,7 +228,7 @@ fn main() {
 
         print!("{time},");
     }
-    println!("");
+    println!();
 
     for note in NOTES_RANGE {
         let name = get_note_name(note);
@@ -236,7 +241,7 @@ fn main() {
                 print!(",");
             }
         }
-        println!("");
+        println!();
     }
 }
 
