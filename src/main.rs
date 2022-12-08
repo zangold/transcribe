@@ -251,11 +251,11 @@ mod tests {
 
     // Generate a tone using the given frequencies, at the given sample rate, for the given number
     // of samples.
-    fn make_tone_iter<'a>(
-        frequencies: &'a [f32],
+    fn make_tone_iter(
+        frequencies: &[f32],
         sample_rate: usize,
         num_samples: usize,
-    ) -> impl Iterator<Item = f32> + 'a {
+    ) -> impl Iterator<Item = f32> + '_ {
         use std::f32::consts::PI;
 
         (0..num_samples).into_iter().map(move |x| {
