@@ -1,17 +1,12 @@
-use collect_slice::CollectSlice;
 use itertools::Itertools;
-use std::cmp::min;
-use std::error::Error;
-
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
+use std::error::Error;
 
 type Note = i32;
 
 // A0 to C8
 const NOTES_RANGE: std::ops::Range<i32> = -48..40;
-
-const NUM_NOTES: usize = (NOTES_RANGE.end - NOTES_RANGE.start) as usize;
 
 /// Computes the frequency of the given note, where 'note' is an integer representing the number of
 /// semitones above (+ve) or below (-ve) A4. Assumes A4 is tuned to 440Hz and notes are distributed
@@ -20,15 +15,18 @@ fn get_note_freq(note: Note) -> f32 {
     440.0_f32 * 2.0_f32.powf(note as f32 / 12.0_f32)
 }
 
-/// Convert a note value into an index into an array of notes; i.e., map from NOTES_RANGE to (0, 88)
-fn note_index(note: Note) -> usize {
-    (note - NOTES_RANGE.start) as usize
+fn closest_note(frequency: f32) -> Option<Note> {
+    if frequency < get_note_freq(NOTES_RANGE.start + 12)
+        || frequency > get_note_freq(NOTES_RANGE.end)
+    {
+        None
+    } else {
+        Some((12.0_f32 * (frequency / 440.0_f32).log2()).round() as Note)
+    }
 }
 
 #[allow(dead_code)]
 fn get_note_name(note: Note) -> String {
-    assert!(NOTES_RANGE.contains(&note));
-
     // Consider 0 to be the middle C in this context, so our "A above middle C"
     // is now 9
     let c_note = note + 9;
@@ -77,10 +75,7 @@ fn merge_audio(
     samples: creak::SampleIterator,
 ) -> impl Iterator<Item = f32> + 'static {
     let channels = info.channels();
-    samples
-        .into_iter()
-        .map(|x| x.unwrap())
-        .step_by(channels)
+    samples.into_iter().map(|x| x.unwrap()).step_by(channels)
 }
 
 #[allow(dead_code)]
@@ -100,10 +95,7 @@ fn print_frequency_spectrum(bins: &[Complex<f32>]) {
 
 /// Convert the given samples into the frequency spectrum.
 /// Zip the resulting iterator with NOTES_RANGE to get the int/f32 Note/magnitude pair
-fn do_fourier_transform(
-    samples: &[f32],
-    sample_frequency: usize,
-) -> impl Iterator<Item = f32> + 'static {
+fn do_fourier_transform(samples: &[f32]) -> impl Iterator<Item = f32> + 'static {
     // make an FFT planner
     let mut real_planner = RealFftPlanner::<f32>::new();
 
@@ -121,26 +113,7 @@ fn do_fourier_transform(
     // Forward transform the input data
     r2c.process(&mut indata, &mut spectrum).unwrap();
 
-    let bin_width = sample_frequency as f32 / (samples.len() as f32);
-
-    // TODO bin_width is generally going to be too low to distinguish between low-end notes. Give
-    // the user a warning here that indicates the range of notes that might be incorrect due to
-    // fourier transform inaccuracies in the low range.
-
-    // Notes frequently lie "between" bins, so take the weighted average of the
-    // norms of the adjacent bins when computing a note's magnitude.
-    let weighted_index = move |bin: f32| -> f32 {
-        let first = spectrum[bin as usize].norm();
-        let second = spectrum[bin as usize + 1].norm();
-
-        let interp = bin - bin.floor();
-
-        first * (1.0 - interp) + second * interp
-    };
-
-    // Now that we have the frequency spectrum, select the bins that correspond
-    // to notes.
-    NOTES_RANGE.map(move |note| weighted_index(get_note_freq(note) / bin_width))
+    spectrum.into_iter().map(|x| x.norm())
 }
 
 fn main() {
@@ -151,89 +124,70 @@ fn main() {
 
     // Set our window for fourier transforms to 0.2 seconds. This might cause problems with the low
     // end couple of octaves, where the notes don't differ by more than a few Hz.
-    let num_samples = sample_hz / 5;
+    let window_width = sample_hz / 5;
 
     // 'stride' is the number of samples that we move our window forward each frame.
-    let stride = num_samples / 4;
+    let stride = window_width / 4;
 
-    let mut window_start = 0;
-    let mut note_mag_time_series = Vec::<[f32; NUM_NOTES]>::new();
-    let mut series_index = 0;
+    let bin_width = sample_hz as f32 / (window_width as f32);
 
-    println!(
-        "Info: allocating {} bytes for (note/magnitude)-over-time data",
-        std::mem::size_of::<[f32; NUM_NOTES]>() * (samples.len() / stride)
-    );
+    let frames_range = 0..((samples.len() - window_width) / stride);
 
-    note_mag_time_series.resize(samples.len() / stride, [0.0_f32; NUM_NOTES]);
+    // frames is a Vec<Vec<f32>>, where the first index corresponds to the frame number and the
+    // second index corresponds to the bin number from the frequency spectrum.
+    let frames = frames_range
+        .map(|frame_num| {
+            let window_start = frame_num * stride;
+            let window_end = window_start + window_width;
 
-    while window_start + num_samples < samples.len() {
-        do_fourier_transform(
-            &samples[window_start..window_start + num_samples],
-            sample_hz,
-        )
-        .collect_slice_checked(&mut note_mag_time_series[series_index][..]);
+            do_fourier_transform(&samples[window_start..window_end]).collect_vec()
+        })
+        .collect_vec();
 
-        window_start += stride;
-        series_index += 1;
-    }
+    assert!(!frames.is_empty());
+    let bin_count = frames[0].len();
 
-    let mut note_time_series = Vec::<[bool; NUM_NOTES]>::new();
-    note_time_series.resize(note_mag_time_series.len(), [false; NUM_NOTES]);
+    let threshold = 50.0_f32;
 
-    for frame_index in 1..note_mag_time_series.len() - 1 {
-        let prev_frame = &note_mag_time_series[frame_index - 1];
-        let frame = &note_mag_time_series[frame_index];
-        let next_frame = &note_mag_time_series[frame_index + 1];
+    // Process the data in 'frames' into a time series of Vec<bool> which indicates where
+    // each note was played. Drop the first/last frames/bins to make the inner code a bit nicer.
+    let note_frames = (1..frames.len() - 1)
+        .map(|frame| {
+            (1..bin_count - 1)
+                .map(|bin| {
+                    if frames[frame - 1][bin] > frames[frame][bin]
+                        || frames[frame + 1][bin] > frames[frame][bin]
+                    {
+                        return (bin, false);
+                    }
 
-        for note in NOTES_RANGE.start + 1..NOTES_RANGE.end - 1 {
-            let note_index = note_index(note);
+                    if frames[frame][bin - 1] > frames[frame][bin]
+                        || frames[frame][bin + 1] > frames[frame][bin]
+                    {
+                        return (bin, false);
+                    }
 
-            // threshold check: if this note was super quiet, then it probably wasn't played.
-            if frame[note_index] < 5.0_f32 {
-                continue;
-            }
+                    (bin, frames[frame][bin] > threshold)
+                })
+                .filter_map(|(bin, spike)| {
+                    if spike {
+                        closest_note(bin as f32 * bin_width)
+                    } else {
+                        None
+                    }
+                })
+                .collect_vec()
+        })
+        .collect_vec();
 
-            // neighbour check: if the adjacent notes are quieter than this one, this probably
-            // was played.
-            if !(frame[note_index - 1] < frame[note_index]
-                && frame[note_index] > frame[note_index + 1])
-            {
-                continue;
-            }
+    for (index, note_frame) in note_frames.iter().enumerate() {
+        let frame_start_time = index as f32 * stride as f32 / sample_hz as f32;
+        print!("Frame {} ({}):", index, frame_start_time);
 
-            // temporal check: if this note was quieter in the last frame, and is quieter in
-            // the next frame, then it was likely to just have been played.
-            if !(prev_frame[note_index] < frame[note_index]
-                && frame[note_index] > next_frame[note_index])
-            {
-                continue;
-            }
-
-            note_time_series[frame_index][note_index] = true;
+        for note in note_frame {
+            print!(" {}", get_note_name(*note));
         }
-    }
 
-    // Output the time series as CSV.
-    print!("time,");
-    for i in 0..min(100, note_mag_time_series.len()) {
-        let time = (i * stride) as f32 / (sample_hz as f32);
-
-        print!("{time},");
-    }
-    println!();
-
-    for note in NOTES_RANGE {
-        let name = get_note_name(note);
-        print!("{},", name);
-
-        for i in 0..min(100, note_mag_time_series.len()) {
-            if note_time_series[i][note_index(note)] {
-                print!("{}({}),", name, note_mag_time_series[i][note_index(note)]);
-            } else {
-                print!(",");
-            }
-        }
         println!();
     }
 }
@@ -241,6 +195,32 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn naive_select_notes<'a>(
+        bin_width: f32,
+        frequency_spectrum_iter: impl Iterator<Item = f32> + 'a,
+    ) -> impl Iterator<Item = f32> + 'a {
+        // TODO bin_width is generally going to be too low to distinguish between low-end notes. Give
+        // the user a warning here that indicates the range of notes that might be incorrect due to
+        // fourier transform inaccuracies in the low range.
+
+        let spectrum = frequency_spectrum_iter.collect_vec();
+
+        // Notes frequently lie "between" bins, so take the weighted average of the
+        // norms of the adjacent bins when computing a note's magnitude.
+        let weighted_index = move |bin: f32| -> f32 {
+            let first = spectrum[bin as usize];
+            let second = spectrum[bin as usize + 1];
+
+            let interp = bin - bin.floor();
+
+            first * (1.0 - interp) + second * interp
+        };
+
+        // Now that we have the frequency spectrum, select the bins that correspond
+        // to notes.
+        NOTES_RANGE.map(move |note| weighted_index(get_note_freq(note) / bin_width))
+    }
 
     // Generate a tone using the given frequencies, at the given sample rate, for the given number
     // of samples.
@@ -265,9 +245,14 @@ mod tests {
 
         let threshold = 50.0_f32;
 
+        let bin_width = sample_hz as f32 / (samples.len() as f32);
+
         assert_eq!(
             NOTES_RANGE
-                .zip(do_fourier_transform(&samples[..], sample_hz))
+                .zip(naive_select_notes(
+                    bin_width,
+                    do_fourier_transform(&samples[..])
+                ))
                 .filter(|(_note, mag)| *mag > threshold)
                 .map(|(x, _y)| x)
                 .collect_vec(),
@@ -305,7 +290,6 @@ mod tests {
 
     #[test]
     fn sanity_num_notes() {
-        assert_eq!(NUM_NOTES, 88);
         assert_eq!(NOTES_RANGE.count(), 88)
     }
 }

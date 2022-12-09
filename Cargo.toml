@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 collect_slice = "1.2.0"
 creak = "0.3.0"
+rayon = "1.5"
 realfft = "3.1.0"
 rustfft = "6.1.0"
 itertools = "0.10.5"
