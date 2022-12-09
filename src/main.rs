@@ -71,7 +71,7 @@ fn load(filename: &str) -> Result<(creak::AudioInfo, creak::SampleIterator), Box
 /// Does some preliminary processing on the SampleIterator to make the upcoming
 /// work easier:
 /// - unwraps the Results for each sample
-/// - merges two channels into one, if two channels are present
+/// - remove samples from all but the first channel
 fn merge_audio(
     info: &creak::AudioInfo,
     samples: creak::SampleIterator,
@@ -80,14 +80,7 @@ fn merge_audio(
     samples
         .into_iter()
         .map(|x| x.unwrap())
-        .batching(move |it| match channels {
-            1 => it.next(),
-            2 => match it.next() {
-                None => None,
-                Some(l) => it.next().map(|_r| l),
-            },
-            x => panic!("Invalid number of channels: {x}"),
-        })
+        .step_by(channels)
 }
 
 #[allow(dead_code)]
