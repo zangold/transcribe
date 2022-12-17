@@ -1,7 +1,6 @@
 use itertools::Itertools;
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
-use std::error::Error;
 
 type Note = i32;
 
@@ -53,17 +52,9 @@ fn get_note_name(note: Note) -> String {
     format!("{note_name}{octave}")
 }
 
-fn load(filename: &str) -> Result<(creak::AudioInfo, creak::SampleIterator), Box<dyn Error>> {
+fn load(filename: &str) -> Result<(creak::AudioInfo, creak::SampleIterator), creak::DecoderError> {
     let decoder = creak::Decoder::open(filename)?;
-
-    let audio_info = decoder.info();
-    let samples = decoder.into_samples()?;
-
-    println!("audio: sample rate {} Hz", audio_info.sample_rate());
-    println!("       channels: {}", audio_info.channels());
-    println!("       format: {:?}", audio_info.format());
-
-    Ok((audio_info, samples))
+    Ok((decoder.info(), decoder.into_samples()?))
 }
 
 /// Does some preliminary processing on the SampleIterator to make the upcoming
