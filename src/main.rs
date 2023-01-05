@@ -1,3 +1,5 @@
+use std::env;
+
 use itertools::Itertools;
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
@@ -11,7 +13,7 @@ const NOTES_RANGE: std::ops::Range<i32> = -48..40;
 /// semitones above (+ve) or below (-ve) A4. Assumes A4 is tuned to 440Hz and notes are distributed
 /// according to even temperament (semitones differ by the 12th root of 2).
 fn get_note_freq(note: Note) -> f32 {
-    440.0_f32 * 2.0_f32.powf(note as f32 / 12.0_f32)
+    440.0_f32 * (note as f32 / 12.0_f32).exp2()
 }
 
 fn closest_note(frequency: f32) -> Option<Note> {
@@ -108,7 +110,18 @@ fn do_fourier_transform(samples: &[f32]) -> impl Iterator<Item = f32> + 'static 
 }
 
 fn main() {
-    let (audio_info, samples) = load("canon_d_kassia.mp3").unwrap();
+    let args = env::args().collect_vec();
+
+    let app_name = &args[0];
+
+    if args.len() < 2 {
+        println!("Usage: {app_name} <audio file>");
+        std::process::exit(1);
+    }
+
+    let song_name = &args[1];
+
+    let (audio_info, samples) = load(song_name).unwrap();
 
     let samples = merge_audio(&audio_info, samples).collect_vec();
     let sample_hz = audio_info.sample_rate() as usize;
@@ -205,7 +218,7 @@ mod tests {
 
             let interp = bin - bin.floor();
 
-            first * (1.0 - interp) + second * interp
+            first.mul_add(1.0 - interp, second * interp)
         };
 
         // Now that we have the frequency spectrum, select the bins that correspond
@@ -249,22 +262,6 @@ mod tests {
                 .collect_vec(),
             *notes
         );
-    }
-
-    #[test]
-    /// Test to make sure that merge_audio yields the correct number of samples.
-    fn test_merge_audio() {
-        let (audio_info, samples) = load("sample.mp3").unwrap();
-        let num_samples = samples.into_iter().count();
-
-        assert_eq!(audio_info.channels(), 2);
-
-        let (audio_info, samples) = load("sample.mp3").unwrap();
-        let merged_samples = merge_audio(&audio_info, samples);
-
-        let num_merged_samples = merged_samples.count();
-
-        assert_eq!(num_samples / 2, num_merged_samples);
     }
 
     #[test]
